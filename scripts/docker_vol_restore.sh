@@ -59,9 +59,7 @@ docker-compose up -d
 
 # Delete ES indexes
 echo "Deleting ES indexes..."
-docker exec -it sonarqube bash
-rm -rf data/es8/*
-exit
+docker exec sonarqube rm -rf data/es8/*
 docker-compose down
 docker-compose up -d
 
