@@ -1,44 +1,68 @@
 #!/bin/bash
-#To Use This script you must pass BACKUP_DATE and it should be "day-month-year, exp:"27-03-24").
+# To Use This script, pass BACKUP_DATE in the format "day-month-year", e.g., "27-03-24".
 echo -n "The BACKUP_DATE IS: "
 read BACKUP_DATE
 
-#Download The Backup volumes from kf-sonarqube-backup S3 Bucket under /srv/sonarqube/
-echo "Downloading.... Backup volumes from kf-sonarqube-backup S3 Bucket under /srv/sonarqube/"
-rm -rf /srv/sonarqube/$BACKUP_DATE
-sudo aws s3 sync s3://kf-sonarqube-backup/$BACKUP_DATE /srv/sonarqube/$BACKUP_DATE
+# Variables
+BACKUP_DIR="/srv/sonarqube/$BACKUP_DATE"
+S3_BUCKET="s3://kf-sonarqube-backup"
 
-#Shutdown all containers
-echo "Shutdown.... all containers"
-cd /home/ec2-user/sonarqube-docker
-docker-compose down
+# Download the backup volumes from S3 to the local backup directory
+echo "Downloading backup volumes from $S3_BUCKET to $BACKUP_DIR..."
+rm -rf $BACKUP_DIR
+sudo aws s3 sync $S3_BUCKET/$BACKUP_DATE $BACKUP_DIR
 
-#Restore DB Data Volume
-echo "Restoring.... DB Data Volume"
-docker run --rm --mount source=kf-sonarqube_postgresql_data,target=/var/lib/postgresql/data -v /srv/sonarqube/$BACKUP_DATE/:/backup busybox tar -xzvf /backup/kf-sonarqube_postgresql_data_$BACKUP_DATE.tar.gz -C /var/lib/postgresql/data
-docker run -i --mount source=kf-sonarqube_postgresql_data,target=/var/lib/postgresql/data busybox sh -c "cd /var/lib/postgresql/data/; rm -rf PG_VERSION global/ base/ pg_* post*; mv $BACKUP_DATE/kf-sonarqube_postgresql_data/volume/* .; rm -rf $BACKUP_DATE/"
+# Shutdown application-related containers (but keep the database container running)
+echo "Shutting down application-related containers..."
+cd /home/ec2-user/sonarqube-docker-postgress
+docker-compose down --remove-orphans
 
-#Restore SQ Config Volume
-echo "Restoring.... SQ Config Volume"
-docker run --rm --mount source=kf-sonarqube_sonarqube_conf,target=/opt/sonarqube/conf -v /srv/sonarqube/$BACKUP_DATE/:/backup busybox tar -xzvf /backup/kf-sonarqube_sonarqube_conf_$BACKUP_DATE.tar.gz -C /opt/sonarqube/conf
-docker run -i --mount source=kf-sonarqube_sonarqube_conf,target=/opt/sonarqube/conf busybox sh -c "cd /opt/sonarqube/conf; rm -rf sonar.properties; mv $BACKUP_DATE/kf-sonarqube_sonarqube_conf/volume/* .; rm -rf $BACKUP_DATE/; chmod -R 777 /opt/sonarqube/conf"
+# Restore all other volumes
+echo "Restoring Docker volumes..."
+for VOLUME in sonarqube-docker-postgress_postgresql_data sonarqube-docker-postgress_sonarqube_conf sonarqube-docker-postgress_sonarqube_data sonarqube-docker-postgress_sonarqube_extensions sonarqube-docker-postgress_sonarqube_logs; do
+    VOLUME_BACKUP_DIR="$BACKUP_DIR/$VOLUME"
+    VOLUME_BACKUP_FILE="$VOLUME_BACKUP_DIR/${VOLUME}_${BACKUP_DATE}.tar.gz"
 
-#Restore SQ Data Volume
-echo "Restoring.... SQ Data Volume"
-docker run --rm --mount source=kf-sonarqube_sonarqube_data,target=/opt/sonarqube/data -v /srv/sonarqube/$BACKUP_DATE/:/backup busybox tar -xzvf /backup/kf-sonarqube_sonarqube_data_$BACKUP_DATE.tar.gz -C /opt/sonarqube/data
-docker run -i --mount source=kf-sonarqube_sonarqube_data,target=/opt/sonarqube/data busybox sh -c "cd /opt/sonarqube/data; rm -rf README.txt es8/ sonar.mv.db web/; mv $BACKUP_DATE/kf-sonarqube_sonarqube_data/volume/* .; rm -rf $BACKUP_DATE/; chmod -R 777 /opt/sonarqube/data"
+    echo "Restoring $VOLUME..."
+    docker run --rm --mount source=$VOLUME,target=/volume -v $VOLUME_BACKUP_DIR:/backup busybox tar -xzvf /backup/${VOLUME}_${BACKUP_DATE}.tar.gz -C /volume
+    docker run -i --mount source=$VOLUME,target=/volume busybox sh -c "cd /volume; chmod -R 777 /volume"
+done
 
-#Restore SQ Extension Volume
-echo "Restoring.... SQ Extension Volume"
-docker run --rm --mount source=kf-sonarqube_sonarqube_extensions,target=/opt/sonarqube/extensions -v /srv/sonarqube/$BACKUP_DATE/:/backup busybox tar -xzvf /backup/kf-sonarqube_sonarqube_extensions_$BACKUP_DATE.tar.gz -C /opt/sonarqube/extensions
-docker run -i --mount source=kf-sonarqube_sonarqube_extensions,target=/opt/sonarqube/extensions busybox sh -c "cd /opt/sonarqube/extensions; rm -rf downloads/ jdbc-driver/ plugins/; mv $BACKUP_DATE/kf-sonarqube_sonarqube_extensions/volume/* .; rm -rf $BACKUP_DATE/; chmod -R 777 /opt/sonarqube/extensions/"
+# Restore DB Data Volume
+echo "Starting database container for restore..."
+docker-compose up -d db
+sleep 30
 
-#Restore SQ Logs Volume
-echo "Restoring.... SQ Logs Volume"
-docker run --rm --mount source=kf-sonarqube_sonarqube_logs,target=/opt/sonarqube/logs -v /srv/sonarqube/$BACKUP_DATE/:/backup busybox tar -xzvf /backup/kf-sonarqube_sonarqube_logs_$BACKUP_DATE.tar.gz -C /opt/sonarqube/logs
-docker run -i --mount source=kf-sonarqube_sonarqube_logs,target=/opt/sonarqube/logs busybox sh -c "cd /opt/sonarqube/logs/; rm -rf README.txt *.log; mv $BACKUP_DATE/kf-sonarqube_sonarqube_logs/volume/* .; rm -rf 28-03-24/; chmod -R 777 /opt/sonarqube/logs/"
+echo "Drop Sonarqube DB Tables..."
+docker exec db psql -U sonar -d sonarqube -c "
+DO
+\$\$
+BEGIN
+  EXECUTE (
+    SELECT string_agg('DROP TABLE IF EXISTS ' || tablename || ' CASCADE;', ' ')
+    FROM pg_tables
+    WHERE schemaname = 'public'
+  );
+END
+\$\$;"
 
-#Finally Run All Containers
-echo "Run.... all containers"
-cd /home/ec2-user/sonarqube-docker
+echo "Restoring DB Data SQL..."
+DB_BACKUP="$BACKUP_DIR/db/sonar-postgres-$BACKUP_DATE.sql"
+docker exec -i db psql -U sonar -d sonarqube --set ON_ERROR_STOP=on --single-transaction < $DB_BACKUP
+
+echo "Stopping database container..."
+docker-compose stop db
+
+# Start all containers
+echo "Starting all containers..."
 docker-compose up -d
+
+# Delete ES indexes
+echo "Deleting ES indexes..."
+docker exec -it sonarqube bash
+rm -rf data/es8/*
+exit
+docker-compose down
+docker-compose up -d
+
+echo "Restore completed successfully."
